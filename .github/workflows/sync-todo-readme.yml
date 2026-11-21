@@ -1,0 +1,157 @@
+name: Sync TODO README
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-todo-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Update README TODO entries changed from main
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          root = Path.cwd()
+          readme_path = root / "README.md"
+          text = readme_path.read_text(encoding="utf-8")
+
+          # Search every Python file for TODO comments. The text after the
+          # TODO marker is preserved except for the conventional colon that
+          # directly follows a plain "TODO:".
+          todo_re = re.compile(r"^\s*#\s*TODO(?P<rest>.*?)\s*$")
+          todos_by_path = {}
+          total_todo_count = 0
+
+          for path in sorted(root.rglob("*.py")):
+              if ".git" in path.parts or not path.is_file():
+                  continue
+              rel_path = path.relative_to(root).as_posix()
+              entries = []
+              for line_number, line in enumerate(
+                  path.read_text(encoding="utf-8").splitlines(), start=1
+              ):
+                  match = todo_re.match(line)
+                  if not match:
+                      continue
+                  message = match.group("rest")
+                  if message.startswith(":"):
+                      message = message[1:]
+                  message = message.strip()
+                  entries.append((line_number, message))
+              if entries:
+                  todos_by_path[rel_path] = entries
+                  total_todo_count += len(entries)
+
+          subprocess.run(
+              ["git", "fetch", "origin", "main:refs/remotes/origin/main"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          changed_files = subprocess.check_output(
+              ["git", "diff", "--name-only", "origin/main...HEAD"],
+              text=True,
+          ).splitlines()
+          changed_py_paths = sorted(
+              path
+              for path in changed_files
+              if path.endswith(".py") and (root / path).is_file()
+          )
+
+          entry_re = re.compile(
+              r"^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<text>.*)$"
+          )
+          heading = "### 📝 Complete TODO List"
+          lines = text.splitlines()
+          heading_index = lines.index(heading)
+          next_heading_index = next(
+              (
+                  index
+                  for index in range(heading_index + 1, len(lines))
+                  if lines[index].startswith("## ")
+              ),
+              len(lines),
+          )
+
+          old_entries = []
+          for index in range(heading_index + 1, next_heading_index):
+              match = entry_re.match(lines[index])
+              if match:
+                  old_entries.append(
+                      {
+                          "line_index": index,
+                          "raw": lines[index],
+                          "path": match.group("path"),
+                          "line": int(match.group("line")),
+                          "text": match.group("text"),
+                      }
+                  )
+
+          old_keys = {(entry["path"], entry["line"], entry["text"]) for entry in old_entries}
+          unchanged_entries = [
+              entry for entry in old_entries if entry["path"] not in changed_py_paths
+          ]
+
+          replacement_entries = []
+          for path in changed_py_paths:
+              for line_number, message in todos_by_path.get(path, []):
+                  replacement_entries.append(
+                      {
+                          "path": path,
+                          "line": line_number,
+                          "raw": f"- [ ] **{path}:{line_number}** - {message}",
+                      }
+                  )
+
+          combined_entries = unchanged_entries + replacement_entries
+          combined_entries.sort(key=lambda entry: (entry["path"], entry["line"]))
+
+          first_index = min(entry["line_index"] for entry in old_entries)
+          last_index = max(entry["line_index"] for entry in old_entries)
+          lines[first_index : last_index + 1] = [
+              entry["raw"] for entry in combined_entries
+          ]
+          readme_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          new_keys = {
+              (entry["path"], entry["line"], entry.get("text", ""))
+              for entry in combined_entries
+          }
+          print(f"Scanned TODO comments: {total_todo_count}")
+          print(f"Changed Python files: {changed_py_paths}")
+          print(f"README entries before: {len(old_entries)}")
+          print(f"README entries after: {len(combined_entries)}")
+          for path in changed_py_paths:
+              print(f"\n{path}")
+              for line_number, message in todos_by_path.get(path, []):
+                  print(f"  {line_number}: {message}")
+          PY
+
+      - name: Commit updated README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "README already up to date"
+          else
+            git commit -m "docs: sync complete TODO list with dev changes"
+            git push origin HEAD:dev
+          fi
